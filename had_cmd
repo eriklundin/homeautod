@@ -1,0 +1,286 @@
+#!/usr/bin/php
+<?php
+/***************************************************************************
+ * File: had_cmd                                         Part of homeautod *
+ *                                                                         *
+ * Copyright (C) 2015 Erik Lundin. All Rights Reserved.                    *
+ *                                                                         *
+ * This program is free software; you can redistribute it and/or modify    *
+ * it under the terms of the GNU General Public License as published by    *
+ * the Free Software Foundation; either version 3 of the License, or	   *
+ * (at your option) any later version.                                     *
+ *                                                                         *
+ * This program is distributed in the hope that it will be useful,         *
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of          *
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the           *
+ * GNU General Public License for more details.                            *
+ *                                                                         *
+ * You should have received a copy of the GNU General Public License	   *
+ * along with homeautod.  If not, see <http://www.gnu.org/licenses/>.	   *
+ *                                                                         *
+ ***************************************************************************/
+
+require_once('lib/lib.constants.php');
+require_once('lib/lib.logger.php');
+require_once('lib/lib.config.php');
+require_once('lib/lib.database.php');
+require_once('lib/lib.utils.php');
+
+function print_usage($txt = NULL) {
+	global $argv;
+
+	if(!empty($txt))
+		echo "$txt\n";
+
+	echo "Usage: {$argv[0]} -c <command> [<arguments>]\n";
+	echo " Commands:\n";
+	echo "  setep              Sets status on endpoint\n";
+	echo "    -i                 Id of endpoint\n";
+	echo "    -s                 Status of endpoint (1/0)\n";
+	echo "  setepvalue         Sets value on endpoint\n";
+	echo "    -i                 Id of endpoint\n";
+	echo "    -v                 Value to set\n";
+	echo "  adddevice          Adds a new device\n";
+	echo "    -d                 Driver name\n";
+	echo "    -p                 Device path\n"; 
+	echo "  deldevice          Deletes a device\n";
+	echo "    -i                 Id number of the device\n";
+	echo "  armzone            Armes a zone\n";
+	echo "    -i                 Id number of zone\n";
+	echo "  disarmzone         Disarmes a zone\n";
+	echo "    -i                 Id number of zone\n";
+	echo "  listactions        Lists all actions\n";
+	echo "  listdevices        Lists all devices\n";
+	echo "  listevents         Lists all events\n";
+	echo "  listtriggers       Lists all triggers\n";
+	echo "  listqueue          Lists all queue items\n";
+	echo "  listzones          Lists all zones\n";
+	exit(1);
+}
+
+function draw_line($len, $cols) {
+	echo '+';
+	foreach($cols as $c) {
+		echo str_repeat('-', $c + 1) . '+';
+	}
+	echo "\n";
+}
+
+function print_list($list) {
+
+	$cols = array();
+
+	foreach($list[0] as $n => $v) {
+		$len = strlen_utf8($n) + 1;
+		if(empty($cols[$n]))
+			$cols[$n] = $len;
+		else if($cols[$n] < $len)
+			$cols[$n] = $len;
+	}
+
+	foreach($list as $v) {
+		foreach($v as $n2 => $v2) {
+			$len = strlen_utf8($v2) + 1;
+			if(empty($cols[$n2]))
+				$cols[$n2] = $len;
+			else if($cols[$n2] < $len)
+				$cols[$n2] = $len;
+		}
+	}
+
+	$totlen = 0;
+	foreach($cols as $v) {
+		$totlen += $v+2;
+	}
+
+	draw_line($totlen, $cols);
+
+	// Write the headers
+	foreach($list[0] as $n => $v) {
+		echo "| " . str_pad_utf8($n, $cols[$n], ' ');
+	}
+	echo "|\n";
+
+
+	draw_line($totlen, $cols);
+
+	foreach($list as $v) {
+		foreach($v as $n2 => $v2) {
+			echo "| " . str_pad_utf8($v2, $cols[$n2], ' ');
+		}
+		echo "|\n";
+	}
+
+	draw_line($totlen, $cols);
+
+}
+
+function read_args($opts, $args) {
+
+	$ret = array();
+	foreach($args as $n => $v) {
+
+		if(!array_key_exists($n, $opts))
+			print_usage("Argument -{$n} is mandatory for command {$opts['c']}");
+
+		$ret[$v['name']] = $opts[$n];
+	}
+
+	return $ret;
+}
+
+function write_cmdpipe($cmd, $params = '') {
+
+	if(!file_exists(HAD_CMD_PIPE))
+		throw new Exception("Command pipe does not exist: " . HAD_CMD_PIPE);
+
+	if(($fh = fopen(HAD_CMD_PIPE, 'a+')) === FALSE)
+		throw new Exception("Unable to open cmdpipe " . HAD_CMD_PIPE);
+
+	$pdata = '';
+	if(!empty($params))
+		$pdata = json_encode($params);
+
+	fwrite($fh, "{$cmd}: {$pdata}\n");
+	fclose($fh);
+}
+
+try {
+
+	$opt = getopt('c:i:n:d:p:s:v:');
+
+	if(empty($opt['c']))
+		print_usage();		
+
+	$logger = new logger(basename(__FILE__));
+	$config = new config(HAD_CFG_FILE);
+	$database = new database(
+		$config->read('dbtype'),
+		$config->read('dbserver'),
+		$config->read('dbuser'),
+		$config->read('dbpassword'),
+		$config->read('dbname'),
+		$logger
+	);
+
+	$list = array();
+
+	switch($opt['c']) {
+		case 'listqueue':
+			echo "Listing queue\n";
+			$list = $database->getdata('
+				SELECT
+					q.id,
+					q.event_id,
+					q.endpoint_id,
+					from_unixtime(q.time_end) as time_end,
+					e.name as endpoint_name,
+					ev.name as event_name
+				FROM
+					queue q
+				INNER JOIN
+					endpoints e ON e.id = q.endpoint_id
+				INNER JOIN
+					events ev ON ev.id = q.event_id
+			');
+		break;
+		case 'listactions':
+			echo "Listing actions\n";
+			$list = $database->getdata('
+				SELECT
+					a.id,
+					a.event_id,
+					ev.name as event_name,
+					a.endpoint_id,
+					e.name as endpoint_name,
+					a.ep_status,
+					a.min_time,
+					a.add_time
+				FROM
+					actions a
+				INNER JOIN
+					endpoints e ON e.id = a.endpoint_id
+				INNER JOIN
+					events ev ON ev.id = a.event_id
+			');
+		break;
+		case 'listdevices':
+			echo "Listing devices\n";
+			$list = $database->getdata('SELECT id,enabled,zone_id,name,path FROM devices');
+		break;
+		case 'listevents':
+			echo "Listing events\n";
+			$list = $database->getdata('SELECT id,enabled,name FROM events');
+		break;
+		case 'listtriggers':
+			echo "Listing triggers\n";
+			$list = $database->getdata('
+				SELECT
+					t.id,
+					t.event_id,
+					ev.name as event_name,
+					t.endpoint_id,
+					e.name as endpoint_name
+				FROM
+					triggers t
+				INNER JOIN
+					endpoints e ON e.id = t.endpoint_id
+				INNER JOIN
+					events ev ON ev.id = t.event_id
+			');
+		break;
+		case 'listzones':
+			echo "Listing zones\n";
+			$list = $database->getdata('SELECT id,pid,name,armed FROM zones');
+		break;
+		case 'adddevice':
+			$params = read_args($opt,
+				array(
+					'n' => array('name' => 'name'),
+					'd' => array('name' => 'driver'),
+					'p' => array('name' => 'path')
+				)
+			);
+		break;
+		case 'deldevice':
+		case 'armzone':
+		case 'disarmzone':
+			$params = read_args($opt,
+				array(
+					'i' => array('name' => 'id')
+				)
+			);
+		break;
+
+		case 'setep':
+			$params = read_args($opt,
+				array(
+					'i' => array('name' => 'id'),
+					's' => array('name' => 'status')
+				)
+			);
+		break;
+
+		case 'setepvalue':
+			$params = read_args($opt,
+				array(
+					'i' => array('name' => 'id'),
+					'v' => array('name' => 'value')
+				)
+			);
+		break;
+
+		default:
+			throw new Exception("Unknown command: '{$opt['c']}'");
+	}
+
+	if(!empty($params))
+		write_cmdpipe(strtoupper($opt['c']), $params);
+
+	if(!empty($list))
+		print_list($list);
+
+} catch(Exception $e) {
+	echo "ERROR: {$e->getMessage()}\n";
+	exit(1);
+}

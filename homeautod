@@ -1,0 +1,747 @@
+#!/usr/bin/php
+<?php
+/***************************************************************************
+ * File: homeautod                                       Part of homeautod *
+ *                                                                         *
+ * Copyright (C) 2015 Erik Lundin. All Rights Reserved.                    *
+ *                                                                         *
+ * This program is free software; you can redistribute it and/or modify    *
+ * it under the terms of the GNU General Public License as published by    *
+ * the Free Software Foundation; either version 3 of the License, or	   *
+ * (at your option) any later version.                                     *
+ *                                                                         *
+ * This program is distributed in the hope that it will be useful,         *
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of          *
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the           *
+ * GNU General Public License for more details.                            *
+ *                                                                         *
+ * You should have received a copy of the GNU General Public License	   *
+ * along with homeautod.  If not, see <http://www.gnu.org/licenses/>.	   *
+ *                                                                         *
+ ***************************************************************************/
+
+require_once('lib/lib.actions.php');
+require_once('lib/lib.logger.php');
+require_once('lib/lib.config.php');
+require_once('lib/lib.database.php');
+require_once('lib/lib.devices.php');
+require_once('lib/lib.triggers.php');
+require_once('lib/lib.schedules.php');
+require_once('lib/lib.utils.php');
+require_once('lib/lib.zones.php');
+require_once('lib/lib.events.php');
+require_once('lib/lib.queue.php');
+require_once('lib/lib.users.php');
+
+declare(ticks = 1);
+
+function fatal_handler() {
+	global $logger;
+	$error = error_get_last();
+	if($error !== NULL && !preg_match("/Interrupted system call/", $error['message']))
+		$logger->log(LOG_WARNING, "Fatal error in file '{$error['file']}' on line {$error['line']}: {$error['message']}");
+}
+
+function sig_handler($signo) {
+	global $g_quit, $g_devices, $logger;
+	switch($signo) {
+		case SIGINT:
+			$logger->log(LOG_INFO, "Received SIGINT signal. Shutting down...");
+			$g_quit = true;
+		break;
+		case SIGTERM:
+			$logger->log(LOG_INFO, "Received SIGTERM signal. Shutting down...");
+			$g_quit = true;
+		break;
+	}
+
+	if($g_quit === true) {
+                // If init.d doesn't send a sigterm to all children we send it ourself.
+		foreach($g_devices as $d) {
+			if(isset($d['proc'])) {
+				$info = proc_get_status($d['proc']);
+				posix_kill($info['pid'], SIGTERM);
+                        }
+		}
+	}
+
+}
+
+function process_event_trigger_schedules() {
+	global $g_triggers, $logger, $g_shedqueue;
+
+	foreach($g_triggers as $t) {
+
+		if(empty($t['schedule_id']))
+			continue;
+
+		if(($ev = find_event_by_id($t['event_id'])) === FALSE) {
+			$logger->log(LOG_WARNING, "Unable to find event with id {$t['event_id']} for trigger {$t['id']}");
+			continue;			
+		}
+
+		if(($ss = check_schedule($t['schedule_id'])) === FALSE)
+			continue;
+
+		run_actions($ev, $t);
+	
+	}
+}
+
+function process_queue() {
+	global $logger, $g_devices, $g_queue, $database;
+
+	$now = time();
+
+	foreach($g_devices as $dn => $dv) {
+		foreach($dv['endpoints'] as $en => $e) {
+
+			// Only process the queue after we have recevied the initial state.
+			if($e['io_type'] == 'output' && !is_null($e['status'])) {
+				// Loop through the queue and check if we have any events
+				// holding a state.
+				$found = 0;
+				foreach($g_queue as $n => $v) {
+
+					if($v['time_end'] < $now) {
+						$logger->log(LOG_DEBUG, "Deleting queue item {$v['id']} from queue");
+						remove_from_queue($n);
+						continue;
+					}
+
+					if($v['endpoint_id'] == $e['id']) {
+						// We have an event holding the state.
+						$found = 1;
+					}
+
+				}
+
+				if($found == 0 && !empty($e['normal_state'])) {
+					// No event holding the state. Revert it to the normal state if it's
+					// not already there.
+					$newstate = NULL;
+					if($e['normal_state'] == 'NO' && $e['status'] == HAD_EP_STATUS_HIGH) {
+						$newstate = HAD_EP_STATUS_LOW;
+					} else if($e['normal_state'] == 'NC' && $e['status'] == HAD_EP_STATUS_LOW) {
+						$newstate = HAD_EP_STATUS_HIGH;
+					}
+
+					if(!is_null($newstate)) {
+						$g_devices[$dn]['endpoints'][$en]['status'] = $newstate;
+						$data = array(
+							array('epnumber' => $e['epnumber'], 'status' => $newstate)
+						);
+						$logger->log(LOG_INFO, "Reverting endpoint {$e['name']} ({$e['epnumber']}) on device {$dv['name']} to status " . ep_status_txt($newstate));
+						$g_devices[$dn]['outbuf'] .= 'SETEPDATA:' . create_had_packet($data) . "\n";
+					}
+
+				}
+			}
+		}
+	}
+
+}
+
+function process_cmddata(&$data) {
+	global $database, $logger, $g_devices, $g_zones, $database;
+
+	// See if there is any data to process at all.
+	if(($pos = strrpos($data, "\n")) === false)
+		return false;
+
+	$bdata = substr($data, 0, $pos);
+
+	$rows = explode("\n", $bdata);
+	foreach($rows as $r) {
+
+		if(preg_match("/^([A-Za-z0-9_-]+):(.*)/", $r, $m)) {
+
+			if(!empty($m[2]))
+				$jarr = json_decode($m[2], 1);
+
+			switch($m[1]) {
+				case 'SETEPVALUE':
+				case 'SETEP':
+
+					// Find the endpoint
+					$found = 0;
+					foreach($g_devices as $dn => $dv) {
+						foreach($dv['endpoints'] as $en => $ev) {
+							if($ev['id'] == $jarr['id']) {
+
+								$tmp = array('epnumber' => $ev['epnumber']);
+
+								if($m[1] == 'SETEP') {
+									if($jarr['status'] == 1)
+										$tmp['status'] = 1;
+									else
+										$tmp['status'] = 0;
+
+									$logger->log(LOG_INFO, "Setting endpoint {$ev['name']} ({$ev['epnumber']}) on device {$dv['name']} to status " . ep_status_txt($tmp['status']));
+
+								} else if($m[1] == 'SETEPVALUE') {
+									$tmp['value'] = $jarr['value'];
+									$logger->log(LOG_INFO, "Setting endpoint {$ev['name']} ({$ev['epnumber']}) on device {$dv['name']} to value {$jarr['value']}");
+								}
+
+								$edata = array($tmp);
+								$g_devices[$dn]['outbuf'] .= 'SETEPDATA:' . create_had_packet($edata) . "\n";
+								$found = 1;
+							}
+						}
+					}
+
+					if($found == 0)
+						$logger->log(LOG_WARNING, "Unable to find endpoint with id {$jarr['id']}");
+
+				break;
+				case 'RELOAD_ZONES':
+					$logger->log(LOG_INFO, "Reloading zones");
+					$g_zones = load_zones($database);
+				break;
+				case 'ADDDEVICE':
+
+					if(empty($jarr)) {
+						$logger->log(LOG_WARNING, "Received empty data for command pipe command {$m[1]}");
+						continue;
+					}
+
+					try {
+
+						$jarr['enabled'] = 1;
+						$ret = $database->save('devices', $jarr, array(
+							'name' => array('type' => 'string'),
+							'driver' => array('type' => 'driver'),
+							'path' => array('type' => 'string'),
+							'enabled' => array('type' => 'bool')
+						));
+
+						if(init_device($ret) !== FALSE)
+							$g_devices[] = $ret;
+
+						$logger->log(LOG_INFO, "Adding new device {$jarr['name']}");
+
+					} catch(Exception $e) {
+						$logger->log(LOG_WARNING, "Unable to add new device: {$e->getMessage()}");
+						continue;
+					}	
+
+				break;
+
+				case 'DELDEVICE':
+
+					try {
+
+						stop_device($jarr['id']);
+
+						// Find all endpoints connected to this device
+						$eps = $database->getdata("SELECT id FROM `endpoints` WHERE device_id = '{$jarr['id']}'");
+						foreach($eps as $e) {
+							$database->setdata("DELETE FROM `actions` WHERE endpoint_id = '{e['id']}'");
+							$database->setdata("DELETE FROM `triggers` WHERE endpoint_id = '{e['id']}'");
+							$database->setdata("DELETE FROM `queue` WHERE endpoint_id = '{e['id']}'");
+							$database->setdata("DELETE FROM `endpoints' WHERE id = '{$e['id']}'");
+						}
+
+						// Delete the device from the database
+						$database->setdata("DELETE FROM `devices` WHERE id = '{$jarr['id']}'");
+
+						$logger->log(LOG_INFO, "Deleted device with id {$jarr['id']}");
+
+					} catch(Exception $e) {
+						$logger->log(LOG_WARNING, "Unable to delete device: {$e->getMessage()}");
+						continue;
+					}
+
+				break;
+
+				case 'ARMZONE':
+					try {
+						if($jarr['id'] == '*') {
+							foreach($g_zones as $z)
+								arm_zone($z['id'], 1);
+						} else {
+							arm_zone($jarr['id'], 1);
+						}
+					} catch(Exception $e) {
+						$logger->log(LOG_WARNING, "Unable to arm zone: {$e->getMessage()}");
+					}
+				break;
+				case 'DISARMZONE':
+					try {
+
+						if($jarr['id'] == '*') {
+							foreach($g_zones as $z)
+								arm_zone($z['id'], 0);
+						} else {
+							arm_zone($jarr['id'], 0);
+						}
+					} catch(Exception $e) {
+						$logger->log(LOG_WARNING, "Unable to disarm zone: {$e->getMessage()}");
+					}
+				break;
+
+				default:
+					$logger->log(LOG_WARNING, "Unknown command pipe command: {$m[1]}");
+			}
+
+		} else {
+			$logger->log(LOG_WARNING, "Unknown command line: [$r]");
+		}
+	}
+
+	// Cut out the processed data
+	$data = substr($data, $pos + 1);
+}
+
+function handle_ep_data(&$dev, $data) {
+	global $database, $logger, $config, $g_events, $g_devices, $g_zones;
+
+	$found = 0;
+	foreach($dev['endpoints'] as $nep => $ep) {
+		if($ep['epnumber'] == $data['ep']) {
+			$found = 1;
+			break;
+		}
+	}
+
+	if($found == 0) {
+		$logger->log(LOG_WARNING, "Unable to find epnumber {$data['ep']} on device {$dev['id']}");
+		return;
+	}
+
+	if($data['type'] == HAD_EP_DT_EVENT) {
+		switch($data['status']) {
+			case HAD_EP_STATUS_CHANGED:
+				$logger->log(LOG_DEBUG, "Endpoint {$ep['name']} ({$ep['epnumber']}) on device {$dev['name']} changed status");
+			break;
+		}
+	}
+
+	if($data['type'] == HAD_EP_DT_VALUE) {
+		$logger->log(LOG_DEBUG, "Endpoint {$ep['name']} ({$ep['epnumber']}) on device {$dev['name']} has value " . $data['data'] . $data['unit']);
+		$dev['endpoints'][$nep]['value'] = $data['data'];
+
+		$tmp = array_merge($dev['endpoints'][$nep], array('updated' => 'NOW()'));
+		$database->save('endpoints', $tmp,
+			array(
+				'value' => array('type' => 'string'),
+				'updated' => array('type' => 'date')
+			)
+		);
+	}
+
+	if($data['type'] == HAD_EP_DT_STATUS) {
+		switch($data['status']) {
+			case HAD_EP_STATUS_HIGH:
+				$logger->log(LOG_DEBUG, "Endpoint {$ep['name']} ({$ep['epnumber']}) on device {$dev['name']} has status high");
+				$dev['endpoints'][$nep]['status'] = $data['status'];
+			break;
+			case HAD_EP_STATUS_LOW:
+				$logger->log(LOG_DEBUG, "Endpoint {$ep['name']} ({$ep['epnumber']}) on device {$dev['name']} has status low");
+				$dev['endpoints'][$nep]['status'] = $data['status'];
+			break;
+		}
+
+		remove_from_schedqueue($dev['endpoints'][$nep]['id']);
+
+		// Save the endpoint status
+		$tmp = array_merge($dev['endpoints'][$nep], array('updated' => 'NOW()'));
+		$database->save('endpoints', $tmp,
+			array(
+				'status' => array('type' => 'string'),
+				'updated' => array('type' => 'date')
+			)
+		);
+	}
+
+	// Check if we have any matching events
+	foreach($g_events as $ev) {
+
+		$trigger = NULL;
+		foreach($ev['triggers'] as $t) {
+
+			if(empty($t['endpoint_id']) || $t['endpoint_id'] != $ep['id'])
+				continue;
+
+			// Check the schedule
+			if(check_schedule($ev['schedule_id'], $ep) !== TRUE)
+				continue;
+
+			if($data['type'] == HAD_EP_DT_VALUE) {
+				if(check_trigger_value($data['data'], $t) === TRUE)
+					$trigger = $t;
+			} else if($data['type'] == HAD_EP_DT_STATUS || $data['type'] == HAD_EP_DT_EVENT) {
+				if($data['status'] == $t['ep_status'])
+					$trigger = $t;
+			}
+		}
+
+		if(!is_null($trigger))
+			run_actions($ev, $trigger);
+
+	}
+
+}
+
+function process_devicedata(&$dev) {
+	global $logger, $database;
+
+	// See if there is any data to process at all.
+	if(($pos = strrpos($dev['inbuf'], "\n")) === false)
+		return false;
+
+	$bdata = substr($dev['inbuf'], 0, $pos);
+
+	$rows = explode("\n", $bdata);
+	foreach($rows as $r) {
+
+		if(preg_match("/^([A-Za-z0-9_-]+):\s*(.*)/", $r, $m)) {
+
+			switch($m[1]) {
+				case 'DEBUG':
+					$logger->log(LOG_DEBUG, "D:[{$dev['id']}]: {$m[2]}");
+				break;
+				case 'INFO':
+					$logger->log(LOG_INFO, "D:[{$dev['id']}]: {$m[2]}");
+				break;
+				case 'WARNING':
+					$logger->log(LOG_WARNING, "D:[{$dev['id']}]: {$m[2]}");
+				break;
+				case 'CRITICAL':
+					$logger->log(LOG_CRIT, "D:[{$dev['id']}]: {$m[2]}");
+				break;
+				case 'EPDATA':
+					$packet = decode_had_packet($m[2]);
+					foreach($packet as $p) {
+						handle_ep_data($dev, $p);
+					}
+				break;
+				case 'EPUPDATE':
+					$logger->log(LOG_INFO, "Updating endpoints for device {$dev['id']}");
+					$packet = decode_had_packet($m[2]);
+					foreach($packet as $n => $v) {
+						if(($ep = find_endpoint_by_epnum($dev['id'], $n)) === FALSE) {
+							$logger->log(LOG_INFO, "D:[{$dev['id']}] Adding new endpoint {$n} (type = {$v['type']}, io_type = {$v['io_type']})");
+							$v['device_id'] = $dev['id'];
+							$v['epnumber'] = $n;
+							$nep = $database->save('endpoints', $v, array(
+								'device_id' => array('type' => 'int'),
+								'epnumber' => array('type' => 'int'),
+								'type' => array('type' => 'string'),
+								'io_type' => array('type' => 'string')
+							));
+							$dev['endpoints'][] = $nep;
+						}
+					}
+				break;
+				default:
+					$logger->log(LOG_WARNING, "D:[{$dev['id']}] Unknown device command: {$r}");
+			}
+
+		} else {
+			$logger->log(LOG_WARNING, "D:[{$dev['id']}] Unknown device line: [$r]");
+		}
+	}
+
+	// Cut out the processed data
+	$dev['inbuf'] = substr($dev['inbuf'], $pos + 1);
+}
+
+function daemonize($pf, &$lock) {
+	global $logger;
+
+	umask(0);
+	$pid = pcntl_fork();
+
+	if($pid < 0) {
+		$logger->log(LOG_CRIT, "Unable to fork");
+		exit(1);
+	} else if($pid > 0) {
+		// Parent.
+		sleep(2);
+		@flock($lock, LOCK_UN);
+		fclose($lock);
+		exit(0);
+	}
+
+	// Child.
+	if(posix_setsid() === -1) {
+		$logger->log(LOG_CRIT, "Unable to set child as session leader");
+		exit(1);
+	}
+
+	$cpid = pcntl_fork();
+	if($cpid < 0) {
+		$logger->log(LOG_CRIT, "Unable to fork second time");
+		exit(1);
+	} else if($cpid > 0) {
+		// Parent.
+		exit(0);
+	}
+
+	fseek($lock, 0);
+	ftruncate($lock, 0);
+	fwrite($lock, getmypid());
+	fflush($lock);
+
+	// Close old streams
+	fclose(STDIN);
+	fclose(STDOUT);
+	fclose(STDERR);
+
+	$stdIn = fopen('/dev/null', 'r'); // set fd/0
+	$stdOut = fopen('/dev/null', 'w'); // set fd/1
+	$stdErr = fopen('php://stdout', 'w');
+
+	pcntl_signal(SIGTSTP, SIG_IGN);
+	pcntl_signal(SIGTTOU, SIG_IGN);
+	pcntl_signal(SIGTTIN, SIG_IGN);
+	pcntl_signal(SIGHUP, SIG_IGN);
+}
+
+function print_usage($txt = NULL) {
+	global $argv;
+
+	if($txt != NULL)
+		echo "$txt\n";
+	echo "Usage: {$argv[0]} <arguments>\n".
+		"  -h                     Shows this help\n".
+		"  -p <pidfile>           The pidfile to use\n".
+		"  -c <configfile>        Configuration file\n".
+		"  -d                     Run in debug-mode\n".
+		"  -f                     Run in foreground\n";
+	exit(1);
+}
+
+try {
+
+	register_shutdown_function("fatal_handler");
+
+	$logger = new logger('homeautod');
+	$opt = getopt('hdfp:c:');
+
+	if(array_key_exists('h', $opt))
+		print_usage();
+
+	// Set default values
+	$g_pidfile = HAD_PID_FILE;
+	$g_cfgfile = HAD_CFG_FILE;
+	$g_quit = false;
+	$g_lock = NULL;
+	$g_debug = false;
+	$g_devices = array();
+	$g_drvlist = array();
+	$g_cmdpipedata = '';
+	$g_udppool = array();
+
+	if(isset($opt['f']))
+		$logger->stdout(true);
+
+	if(isset($opt['p']) && !empty($opt['p']))
+		$g_pidfile = $opt['p'];
+
+	if(isset($opt['c']) && !empty($opt['c']))
+		$g_cfgfile = $opt['c'];
+
+	if(array_key_exists('d', $opt)) {
+		$logger->log(LOG_INFO, "Enabling debug-mode");
+		$g_debug = true;
+	}
+
+	// Check if the process is already running
+	if(($g_lock = fopen($g_pidfile, 'c+')) === FALSE) {
+		$logger->log(LOG_WARNING, "Unable to open pidfile '{$g_pidfile}'");
+		exit(1);
+	}
+
+	if(!flock($g_lock, LOCK_EX | LOCK_NB, $wouldblock) || $wouldblock) {
+		$logger->log(LOG_WARNING, "Process is already running. Exiting.");
+		exit(1);
+	}
+
+	$logger->debug($g_debug);
+	$config = new config($g_cfgfile);
+	$g_udppool = $config->get_udppool();
+
+	if(($timezone = $config->read('timezone')) !== NULL)
+		date_default_timezone_set($timezone);
+
+	if(($g_puser = $config->read('runasuser')) === NULL) {
+		$logger->log(LOG_WARNING, "runasuser not defined in {$g_cfgfile} running as root");
+	} else {
+		if(($uinfo = posix_getpwnam($g_puser)) === FALSE) {
+			$logger->log(LOG_WARNING, "Unable to get uid for user {$g_puser}. Running as root");
+		} else {
+			if(posix_setgid($uinfo['gid']) === FALSE)
+				throw new Exception("Unable to set gid of process to {$uinfo['gid']}");
+			if(posix_setuid($uinfo['uid']) === FALSE)
+				throw new Exception("Unable to set gid of process to {$uinfo['uid']}");
+		}
+	}
+
+	if(!isset($opt['f']))
+		daemonize($g_pidfile, $g_lock);
+
+	$logger->log(LOG_INFO, "Starting");
+
+	// Load the database
+	$database = new database(
+		$config->read('dbtype'),
+		$config->read('dbserver'),
+		$config->read('dbuser'),
+		$config->read('dbpassword'),
+		$config->read('dbname'),
+		$logger
+	);
+
+	// Register signal handlers
+	pcntl_signal(SIGTERM, "sig_handler");
+	pcntl_signal(SIGINT, "sig_handler");
+
+	if(!file_exists(HAD_CMD_PIPE)) {
+		if(posix_mkfifo(HAD_CMD_PIPE, 0777) === false) //644
+			throw new Exception("Unable to create named pipe " . HAD_CMD_PIPE);
+	}
+
+	$logger->log(LOG_DEBUG, "Opening commandpipe: " . HAD_CMD_PIPE);
+	if(($g_cmdpipe = fopen(HAD_CMD_PIPE, 'r+')) === false)
+		throw new Exception("Unable to open named pipe " . HAD_CMD_PIPE);
+
+	stream_set_blocking($g_cmdpipe, false);
+
+	// Set group to apache
+	if(chgrp(HAD_CMD_PIPE, "homeautod") === FALSE)
+		throw new Exception("Unable to change group to apache on " . HAD_CMD_PIPE);
+
+	if(chmod(HAD_CMD_PIPE, 0664) === FALSE)
+		throw new Exception("Unable to set permissions on " . HAD_CMD_PIPE);
+
+	$g_zones = load_zones($database);
+	$logger->log(LOG_INFO, "Loaded " . count($g_zones) . " zones");
+
+	// Load all available drivers
+	$g_drvlist = load_driverlist();
+
+	// Load devices
+	$g_devices = load_devices();
+	$logger->log(LOG_INFO, "Loaded " . count($g_devices) . " devices");
+
+	// Load events
+	$g_events = load_events($database);
+	$logger->log(LOG_INFO, "Loaded " . count($g_events) . " events");
+
+	// Load schedules
+	$g_schedules = load_schedules();
+	$logger->log(LOG_INFO, "Loaded " . count($g_schedules) . " custom schedules");
+
+	// Load triggers
+	$g_triggers = load_triggers($database);
+	$logger->log(LOG_INFO, "Loaded " . count($g_triggers) . " triggers");
+
+	// Load users
+	$g_users = load_users();
+	$logger->log(LOG_INFO, "Loaded " . count($g_users) . " users");
+
+	// Load saved queue
+	$g_queue = load_queue();
+	$logger->log(LOG_INFO, "Loaded " . count($g_queue) . " queue items");
+
+	$g_shedqueue = array();
+	$logger->log(LOG_DEBUG, "Staring main loop");
+
+	while(true) {
+
+		pcntl_signal_dispatch();
+
+		process_queue();
+		process_event_trigger_schedules();
+
+		$a_read = array($g_cmdpipe);
+		$a_write = array();
+		$a_except = array();
+
+		// Check for devices that needs starting.
+		foreach($g_devices as $n => $v) {
+			if($v['status'] == HAD_DEV_STATUS_LOADED) {
+				start_device($g_devices[$n], $logger, $config);
+			} else if($v['status'] == HAD_DEV_STATUS_STARTED) {
+				$a_read[] = $v['pipes'][1];
+				if(strlen($v['outbuf']) > 0)
+					$a_write[] = $v['pipes'][0];
+			}
+		}
+
+		// Check if any drivers has died
+		foreach($g_devices as $n => $v) {
+			if($v['status'] == HAD_DEV_STATUS_STARTED && $g_quit !== true) {
+				$stat = proc_get_status($v['proc']);
+				if($stat['running'] === FALSE && (time() - $v['started_time']) >= HAD_DEV_RESTART_TIME) {
+
+					// The process has died
+					$logger->log(LOG_INFO, "The process for the device {$v['name']} ({$v['id']}) was not running. Starting.");
+
+					// Clear the ports used by the device
+					$config->free_udpports($g_udppool, $v['id']);
+
+					start_device($g_devices[$n], $logger, $config);
+				}
+			}
+		}
+
+		if(($sel = @stream_select($a_read, $a_write, $a_except, 0, 200000)) > 0) {
+
+			if(in_array($g_cmdpipe, $a_read)) {
+				$ret = fread($g_cmdpipe, 1024);
+				if(!empty($ret)) {
+					$g_cmdpipedata .= $ret;
+					process_cmddata($g_cmdpipedata);
+				}
+			}
+
+			foreach($g_devices as $n => $v) {
+
+				if(array_key_exists(1, $v['pipes']) && in_array($v['pipes'][1], $a_read)) {
+					$ret = fread($v['pipes'][1], 1024);
+					if(!empty($ret)) {
+						$g_devices[$n]['inbuf'] .= $ret;
+						process_devicedata($g_devices[$n]);
+					}
+				}
+
+				if(array_key_exists(0, $v['pipes']) && in_array($v['pipes'][0], $a_write)) {
+					$ret = fwrite($v['pipes'][0], $v['outbuf'], 1024);
+					$logger->log(LOG_DEBUG, "Wrote $ret bytes to device '{$v['outbuf']}'");
+					$g_devices[$n]['outbuf'] = substr($g_devices[$n]['outbuf'], $ret);
+				}
+			}
+
+		}
+
+		if($g_quit == true) {
+			$c_running = 0;
+			foreach($g_devices as $n => $v) {
+				$stat = proc_get_status($v['proc']);
+				if($stat['running'] !== FALSE) {
+						$c_running++;
+				} else {
+					proc_close($v['proc']);
+					unset($g_devices[$n]);
+				}
+			}
+
+			if($c_running == 0) {
+				// We have no devices running. Break the main loop.
+				break;
+			}
+		}
+
+	}
+
+	unlink(HAD_CMD_PIPE);
+	$logger->log(LOG_INFO, "Exiting");
+
+} catch(Exception $e) {
+	$logger->log(LOG_CRIT, $e->getMessage());
+	exit(1);
+}

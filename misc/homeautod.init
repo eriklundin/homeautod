@@ -1,0 +1,83 @@
+#! /bin/sh
+#
+# chkconfig: 345 55 45
+# description:  Homeautod
+# processname: homeautod
+# config: /etc/sysconfig/homeautod
+# pidfile: /var/run/homeautod.pid
+
+# Standard LSB functions
+#. /lib/lsb/init-functions
+
+# Source function library.
+. /etc/init.d/functions
+
+OPTIONS=""
+
+if [ -f /etc/sysconfig/homeautod ];then
+        . /etc/sysconfig/homeautod
+fi
+
+# Check that networking is up.
+. /etc/sysconfig/network
+
+if [ "$NETWORKING" = "no" ]
+then
+        exit 0
+fi
+
+RETVAL=0
+prog="homeautod"
+pidfile=${PIDFILE-/var/run/homeautod.pid}
+lockfile=${LOCKFILE-/var/lock/subsys/homeautod}
+
+start () {
+	echo -n $"Starting $prog: "
+        # Ensure that /var/run/homeautod.pid has proper permissions
+
+        daemon --pidfile ${pidfile} /usr/lib/homeautod/homeautod -p ${pidfile} $OPTIONS
+        RETVAL=$?
+        echo
+	[ $RETVAL -eq 0 ] && touch ${lockfile}
+}
+stop () {
+	echo -n $"Stopping $prog: "
+        killproc -p ${pidfile} /usr/lib/homeautod/homeautod
+        RETVAL=$?
+        echo
+        if [ $RETVAL -eq 0 ] ; then
+                rm -f ${lockfile} ${pidfile}
+        fi
+}
+
+restart () {
+	stop
+	start
+}
+
+# See how we were called.
+case "$1" in
+  start)
+        start
+        ;;
+  stop)
+       	stop
+	;;
+  status)
+        status -p ${pidfile} homeautod
+        RETVAL=$?
+        ;;
+  restart|reload|force-reload)
+        restart
+        ;;
+  condrestart|try-restart)
+        [ -f ${lockfile} ] && restart || :
+
+        ;;
+  *)
+    	echo $"Usage: $0 {start|stop|status|restart|reload|force-reload|condrestart|try-restart}"
+        RETVAL=2
+        ;;
+esac
+
+exit $RETVAL

@@ -1,0 +1,36 @@
+Installation
+---------------------------------------
+
+Unfortunately this release of homeautod doesn't include a GUI to add
+objects. Use the instructions below or simply add them directly to the
+database and restarts homeautod.
+
+Later releases will include a web-based GUI.
+
+Manual installation
+---------------------------------------
+  * Copy the content from the source tar to /usr/lib/homeautod
+  * Create the directory /var/lib/homeautod
+  * Copy homeautod.service to /usr/lib/systemd/system/
+  * Copy homeautod.conf to /etc/homeautod and set it's contents correctly.
+  * Run:
+    * systemctl enable homeautod.service
+    * systemctl daemon-reload
+    * systemctl start homeautod.service
+
+Check the syslog that the daemon started:
+tail -f /var/log/messages
+
+Database installation/upgrade
+---------------------------------------
+Create a database for homeautod
+mysql -e "CREATE datbase homeautod"
+
+Create a user for homeautod with access to that database
+mysql -e "GRANT ALL PRIVILEGES ON homeautod.* TO 'homeautod'@'localhost' IDENTIFIED BY 'changeme'"
+
+Make sure you've edited the settings in /etc/homeautod.conf with the correct database
+settings then run /usr/lib/homeautod/upgrade_haddb
+
+If you're upgrading from a previous version you can use upgrade_haddb to update
+the schema.

@@ -1,0 +1,181 @@
+#!/usr/bin/php
+<?php
+/***************************************************************************
+ * File: had_drv                                         Part of homeautod *
+ *                                                                         *
+ * Copyright (C) 2015 Erik Lundin. All Rights Reserved.                    *
+ *                                                                         *
+ * This program is free software; you can redistribute it and/or modify    *
+ * it under the terms of the GNU General Public License as published by    *
+ * the Free Software Foundation; either version 3 of the License, or	   *
+ * (at your option) any later version.                                     *
+ *                                                                         *
+ * This program is distributed in the hope that it will be useful,         *
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of          *
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the           *
+ * GNU General Public License for more details.                            *
+ *                                                                         *
+ * You should have received a copy of the GNU General Public License	   *
+ * along with homeautod.  If not, see <http://www.gnu.org/licenses/>.	   *
+ *                                                                         *
+ ***************************************************************************/
+
+require_once('lib/lib.logger.php');
+require_once('lib/lib.utils.php');
+require_once('lib/lib.had_drv_class.php');
+require_once('lib/lib.constants.php');
+
+declare(ticks = 1);
+
+function fatal_handler() {
+	global $logger;
+	$error = error_get_last();
+	if($error !== NULL && !preg_match("/Interrupted system call/", $error['message']))
+		$logger->log(LOG_WARNING, "Fatal error in file '{$error['file']}' on line {$error['line']}: {$error['message']}");
+}
+
+function error_handler($errno, $errstr, $errfile, $errline) {
+	global $logger;
+	if(!preg_match("/Interrupted system call/", $errstr))
+		$logger->log(LOG_WARNING, "{$errstr} (File: {$errfile}, Line: {$errline})");
+	return true;
+}
+
+function print_usage($txt = '') {
+	global $argv;
+	if(!empty($txt))
+		echo "{$txt}\n";
+	echo "Usage: $argv[0] -d <driver> -i <device id> -p <device path>\n";
+	exit(1);
+}
+
+function sig_handler($signo) {
+	global $g_quit, $logger;
+	switch($signo) {
+		case SIGINT:
+			$logger->log(LOG_INFO, "Received SIGINT signal. Shutting down...");
+			$g_quit = true;
+		break;
+		case SIGTERM:
+			$logger->log(LOG_INFO, "Received SIGTERM signal. Shutting down...");
+			$g_quit = true;
+		break;
+	}
+}
+
+try {
+
+	set_error_handler("error_handler");
+	register_shutdown_function("fatal_handler");
+
+	$opt = getopt('hd:p:i:');
+	$g_quit = false;
+	$logger = new logger('had_drv');
+	$logger->stdout(true);
+
+	if(isset($opt['h']))
+		print_usage();
+
+	if(!isset($opt['d']) || empty($opt['d']))
+		print_usage('Option -d is mandatory');
+
+	if(!preg_match("/^[A-Za-z0-9_-]+$/", $opt['d']))
+		print_usage("Driver -d argument contains invalid characters: '{$opt['d']}'");
+
+	if(!isset($opt['i']) || empty($opt['i']))
+		print_usage("Option -i is mandatory");
+
+	if(!is_numeric($opt['i']))
+		print_usage("Option -i is invalid. Has to be a number.");
+
+	if(!isset($opt['p']) || empty($opt['p']))
+		print_usage('Missing path argument: -p');	
+
+	$path = $opt['p'];
+	$inbuf = '';
+	$devid = $opt['i'];
+	$devdatapath = HAD_DEV_DATA_PATH . "/{$devid}";
+	$drvclass = "had_drv_{$opt['d']}";
+	$drvfile = "drv/{$drvclass}.php";
+
+	if(chdir(HAD_HOME_PATH) === FALSE)
+		throw new Exception("Unable to change active directory to '" . HAD_HOME_PATH . "'");
+
+	if(!file_exists($drvfile))
+		throw new Exception("Driver file '{$drvfile}' does not exist");
+
+	include($drvfile);
+
+	if(class_exists($drvclass) === FALSE)
+		throw new Exception("The driver file '{$drvfile}' does not contain the class '$drvclass'");
+
+	$drv = new $drvclass($path, $devid, $devdatapath, $logger);
+
+	pcntl_signal(SIGINT, 'sig_handler');
+	pcntl_signal(SIGTERM, 'sig_handler');
+
+	// Open up stdin
+	stream_set_blocking(STDIN, false);
+
+	while(true) {
+
+		pcntl_signal_dispatch();
+
+		$a_read = array(STDIN);
+		$a_write = array();
+		$a_except = array();
+
+		if($drv->is_init === true)
+			$selarr = $drv->get_select();
+
+		if(!empty($selarr['a_read']))
+			$a_read = array_merge($a_read, $selarr['a_read']);
+		if(!empty($selarr['a_write']))
+			$a_write = array_merge($a_write, $selarr['a_write']);
+		if(!empty($selarr['a_except']))
+			$a_except = array_merge($a_except, $selarr['a_except']);
+
+		if(!empty($a_read) || !empty($a_write) || !empty($a_except)) {
+			if(($ret = @stream_select($a_read, $a_write, $a_except, 0, 200000)) > 0) {
+				if(in_array(STDIN, $a_read)) {
+					$ret = fread(STDIN, 1024);
+					$inbuf .= $ret;
+					if(!empty($inbuf)) {
+						while(($packet = interpret_indata($logger, $inbuf)) !== FALSE) {
+							if($packet['cmd'] == 'SETTINGS') {
+
+								$drv->set_settings($packet['data']);
+								// Initialize the driver after the settings have been loaded
+								$logger->log(LOG_INFO, "Initializing driver {$opt['d']} ({$path})");
+								$drv->init();
+								$drv->is_init = true;
+
+							} else {
+								$drv->set_data($packet['cmd'], $packet['data']);
+							}
+						}
+					}
+				}
+			}
+		}
+
+		$drv->set_select($a_read, $a_write, $a_except);
+		if($drv->is_init === true && $drv->get_data() === false)
+			$g_quit = true;
+
+		// Wait for the driver to deinit until we quit
+		if($g_quit === true &&  $drv->deinit() !== false)
+				break;
+
+		usleep(100);
+	}
+
+
+} catch(Exception $e) {
+
+	if(isset($drv))
+		$drv->deinit();
+
+	$logger->log(LOG_CRIT, $e->getMessage());
+	exit(1);
+}

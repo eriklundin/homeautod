@@ -1,0 +1,12 @@
+[Unit]
+Description=Homeautod service
+
+[Service]
+EnvironmentFile=/etc/sysconfig/homeautod
+PIDFile=/var/run/homeautod.pid
+ExecStart=/usr/lib/homeautod/homeautod $OPTIONS
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target

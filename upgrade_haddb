@@ -1,0 +1,256 @@
+#!/usr/bin/php
+<?php
+/***************************************************************************
+ * File: upgrade_haddb                                   Part of homeautod *
+ *                                                                         *
+ * Copyright (C) 2015 Erik Lundin. All Rights Reserved.                    *
+ *                                                                         *
+ * This program is free software; you can redistribute it and/or modify    *
+ * it under the terms of the GNU General Public License as published by    *
+ * the Free Software Foundation; either version 3 of the License, or       *
+ * (at your option) any later version.                                     *
+ *                                                                         *
+ * This program is distributed in the hope that it will be useful,         *
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of          *
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the           *
+ * GNU General Public License for more details.                            *
+ *                                                                         *
+ * You should have received a copy of the GNU General Public License       *
+ * along with homeautod.  If not, see <http://www.gnu.org/licenses/>.      *
+ *                                                                         *
+ ***************************************************************************/
+
+require_once('lib/lib.constants.php');
+require_once('lib/lib.logger.php');
+require_once('lib/lib.config.php');
+require_once('lib/lib.database.php');
+
+function print_usage() {
+	global $argv;
+	echo "Usage: {$argv[0]} <options>\n";
+	echo "  -f          Upgrade file\n";
+	echo "  -c          Homeautod config file\n";
+	echo "  -h          Database hostname\n";
+	echo "  -u          Database username\n";
+	echo "  -p          Database password\n";
+	echo "  -n          Database name\n";
+	exit(1);
+}
+
+function split_structure($data) {
+
+	$ret = array();
+	$name = '';
+
+	$rows = explode("\n", $data);
+	if(empty($rows))
+		throw new Exception("Unable to interpreter table data");
+
+	if(!preg_match("/^CREATE TABLE `([^`]+)`\s*\($/", $rows[0], $match))
+		throw new Exception("First row does not contain table defenition: {$rows[0]}");
+
+	$name = $match[1];
+	$ret[$name]['comment'] = '';
+	array_shift($rows);
+
+	foreach($rows as $r) {
+
+		$r = trim($r);
+		if(empty($r))
+			continue;
+
+		if(preg_match("/^\s*`([^`]+)`\s*(.+)$/", $r, $match)) {
+			$ret[$name]['columns'][] = array(
+				'name' => $match[1],
+				'data' => rtrim($match[2], ',')
+			);
+		} else if(preg_match("/\s*PRIMARY KEY \(`([^`]+)`\)/i", $r, $match)) {
+			$ret[$name]['keys']['primary'] = array(
+				'name' => $match[1]
+			);
+		} else if(preg_match("/^\s*\)(.+);$/", $r, $match)) {
+			if(preg_match("/COMMENT='([^']+)'/i", $match[1], $m2))
+				$ret[$name]['comment'] = $m2[1];
+			if(preg_match("/ENGINE=([^\s]+)/i", $match[1], $m2))
+				$ret[$name]['engine'] = $m2[1];
+		} else {
+			throw new Exception("Unknown row: $r");
+		}
+	}
+
+	$ret[$name]['createdata'] = $data;
+	return $ret;
+}
+
+function load_structure_db($database) {
+	global $g_dbname;
+
+	$ret = array('tables' => array());
+	$tbllist = $database->getdata('SHOW TABLES');
+
+	foreach($tbllist as $t) {
+		$struct = $database->getdata("SHOW CREATE TABLE `" . $t["Tables_in_{$g_dbname}"] . "`", true);
+		$ret['tables'] = array_merge($ret['tables'], split_structure($struct['Create Table'].';'));
+	}
+
+	return $ret;
+}
+
+function load_structure_file($file) {
+
+	$ret = array('tables' => array());
+
+	if(!file_exists($file))
+		throw new Exception("Structure file $file does not exist.");
+
+	if(($data = @file_get_contents($file)) === FALSE)
+		throw new Exception("Unable to open $file");
+
+	$sections = explode("\n\n", $data);
+
+	// Read out the version
+	$vdata = array_shift($sections);
+	if(!preg_match("/^\-\- VERSION: (.+)/im", $vdata, $m))
+		throw new Exception("Unable to fetch version from file: $file");
+
+	$ret['version'] = $m[1];
+	foreach($sections as $s) {
+		$ret['tables'] = array_merge($ret['tables'], split_structure($s));
+	}
+
+	return $ret;
+}
+
+function find_column($name, $columns) {
+	$prevcol = '';
+	foreach($columns as $n => $v) {
+		if($name == $v['name']) {
+			return array(
+				'index' => $n,
+				'prevcol' => $prevcol,
+				'name' => $v['name'],
+				'data' => $v['data']
+			);
+		}
+		$prevcol = $v['name'];
+	}
+	return FALSE;
+}
+
+function run_query($query) {
+	global $g_sqlhist, $database;
+	$g_sqlhist[] = $query;
+	echo "$query\n";
+	$database->setdata($query);
+}
+
+try {
+
+	$g_sqlhist = array();
+
+	$opt = getopt('f:c:h:u:p:n');
+
+	$logger = new logger(basename(__FILE__));
+	$config = new config(HAD_CFG_FILE);
+
+	$g_dbname = $config->read('dbname');
+	$g_dbname = 'testdb';
+
+	$database = new database(
+		$config->read('dbtype'),
+		$config->read('dbserver'),
+		$config->read('dbuser'),
+		$config->read('dbpassword'),
+		$g_dbname,
+		$logger
+	);
+
+	$newstruct = load_structure_file('homeautod.sql');
+	echo "Upgrading homeautod database '{$g_dbname}' to version {$newstruct['version']}\n";
+
+	start:
+	$len_sql = count($g_sqlhist);
+	if($len_sql >= 2 && $g_sqlhist[$len_sql - 1] == $g_sqlhist[$len_sql - 2])
+		throw new Exception("Same query was run twice in a row. Something went wrong.");
+
+	$oldstruct = load_structure_db($database);
+
+	// Check if any databases columns have been deleted
+	foreach($oldstruct['tables'] as $n => $v) {
+
+		if(!array_key_exists($n, $newstruct['tables'])) {
+			echo "Table {$n} has been deleted. Dropping...\n";
+			run_query("DROP TABLE `{$n}`;");
+			goto start;
+		}
+
+		foreach($v['columns'] as $n2 => $v2) {
+			// Check for deleted columns
+			if(($d = find_column($v2['name'], $newstruct['tables'][$n]['columns'])) === FALSE) {
+				echo "Column '{$v2['name']}' in table '{$n}' has been deleted\n";
+				run_query("ALTER TABLE `{$n}` DROP COLUMN `{$v2['name']}`;");
+				goto start;
+			}
+	
+		}
+
+	}
+
+	foreach($newstruct['tables'] as $n => $v) {
+
+		if(!array_key_exists($n, $oldstruct['tables'])) {
+			echo "Table {$n} is missing. Creating...\n";
+			run_query($v['createdata']);
+			goto start;
+		}
+
+		// Check for added columns
+		$prevcol = '';
+		foreach($v['columns'] as $n2 => $v2) {
+
+			if(($d = find_column($v2['name'], $oldstruct['tables'][$n]['columns'])) === FALSE) {
+
+				$pos = 'FIRST';
+				if(!empty($prevcol))
+					$pos = "AFTER `{$prevcol}`";
+
+				echo "Column '{$v2['name']}' has been added to table '{$n}'\n";
+				run_query("ALTER TABLE `{$n}` ADD COLUMN `{$v2['name']}` {$v2['data']} {$pos};");
+				goto start;
+
+			} else {
+
+				if($d['index'] != $n2 || $d['data'] != $v2['data']) {
+
+					$pos = 'FIRST';
+					if(!empty($d['prevcol']))
+						$pos = "AFTER `{$prevcol}`";
+
+					echo "Column {$v2['name']} has been modified\n";
+					run_query("ALTER TABLE `{$n}` MODIFY COLUMN `{$v2['name']}` {$v2['data']} {$pos};");				
+					goto start;
+				}
+			}
+
+			$prevcol = $v2['name'];
+		}
+
+		// Update the table version
+		$verstr = "version:{$newstruct['version']}";
+		if($oldstruct['tables'][$n]['comment'] != $verstr) {
+			echo "Updating comment version on table {$n}\n";
+			run_query("ALTER TABLE `{$n}` COMMENT = '{$verstr}';");
+			goto start;
+		}
+		
+	}
+
+	if(count($g_sqlhist) > 0)
+		echo "Upgrade complete.\n";
+	else
+		echo "Database is up to date. No update necessary.\n";
+
+} catch(Exception $e) {
+	echo "ERROR: {$e->getMessage()}\n";
+	exit(1);
+}
